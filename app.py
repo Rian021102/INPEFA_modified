@@ -37,7 +37,7 @@ def process_file(file):
         tmpfile.write(file.getvalue())
         tmpfile.seek(0)
         las = lasio.read(tmpfile.name).df()
-        y = las.GR.dropna()
+        y = las.GAMMA.dropna()
         x = np.array(y.index)
         return inpefa(y, x), x, file.name  # Using the original file name
 
