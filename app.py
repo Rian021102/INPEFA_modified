@@ -34,7 +34,13 @@ def process_file(file):
         tmpfile.write(file.getvalue())
         tmpfile.seek(0)
         las = lasio.read(tmpfile.name).df()
-        y = las.GAMMA.dropna()
+        #check if the GR column names is GAMMA, Gamma, GAMMA_ALL, Gamma_all, GAMMA_All, GAMMA_all, Gamma_All, Gamma_all replace with GR
+        name_gr=['GAMMA', 'Gamma', 'GAMMA_ALL', 'Gamma_all', 'GAMMA_All', 'GAMMA_all', 'Gamma_All', 'Gamma_all']
+        for name in name_gr:
+            if name in las.columns:
+                las.rename(columns={name: 'GR'}, inplace=True)
+                break
+        y = las.GR.dropna()
         x = np.array(y.index)
         return inpefa(y, x), x, file.name
 

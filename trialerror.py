@@ -34,7 +34,9 @@ def process_file(file):
         tmpfile.write(file.getvalue())
         tmpfile.seek(0)
         las = lasio.read(tmpfile.name).df()
-        y = las.GAMMA.dropna()
+        #rename the second column to 'GR' for consistency, regardless of its original name
+        las.columns = ['Depth'] + ['GR'] + list(las.columns[2:])
+        y = las.GR.dropna()
         x = np.array(y.index)
         return inpefa(y, x), x, file.name
 
