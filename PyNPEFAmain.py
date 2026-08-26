@@ -136,12 +136,12 @@ def inpefa(y,x):
     ipfy = {}
     ipfy['OG'] = y
     for j in range(1,5):
+        # cvxopt matrix -> flat 1-D array (NumPy 2 rejects size-1 array to scalar)
+        fyj = np.asarray(fy['{0}'.format(j)], dtype=float).ravel()
         # Burg's AR coeff
-        bffy = _arburg2(fy['{0}'.format(j)],32)[0].real
+        bffy = _arburg2(fyj,32)[0].real
         # PEFA
-        pffy = signal.convolve(fy['{0}'.format(j)],
-                               np.reshape(bffy,(len(bffy), 1)),
-                               mode='same')
+        pffy = signal.convolve(fyj, bffy, mode='same')
         # INPEFA
         iipfy = np.cumsum(pffy[::-1])[::-1]
         # Normalized to -1 <= INPEFA <= 1

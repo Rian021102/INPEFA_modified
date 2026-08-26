@@ -11,11 +11,9 @@ st.set_page_config(page_title='INPEFA Well Log Analysis')
 st.title('Integrated Prediction Error Filter Analysis (INPEFA)')
 st.write('This app is a Streamlit implementation of the INPEFA method for well log data.')
 
-st.set_option('deprecation.showPyplotGlobalUse', False)
-
 # Visualization function
 def vislog(inpefa_log, x, filename):
-    plt.figure(figsize=(18, 16), dpi=80, facecolor='w', edgecolor='k')
+    fig = plt.figure(figsize=(18, 16), dpi=80, facecolor='w', edgecolor='k')
     plt.figtext(0.1, 0.95, filename, fontsize=12, ha='left')
     titles = ['Original GR Curve', 'Long Term INPEFA', 'Mid Term INPEFA', 'Short Term INPEFA', 'Shorter Term INPEFA']
     for i, key in enumerate(['OG', '1', '2', '3', '4']):
@@ -27,7 +25,8 @@ def vislog(inpefa_log, x, filename):
         plt.title(titles[i])
         plt.xlim((0, 150) if key == 'OG' else (-1, 1))
 
-    st.pyplot()
+    st.pyplot(fig)
+    plt.close(fig)
 
 def process_file(file):
     with tempfile.NamedTemporaryFile(delete=False, suffix='.las') as tmpfile:
