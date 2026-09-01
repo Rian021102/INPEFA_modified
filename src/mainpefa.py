@@ -97,6 +97,9 @@ before -- already satisfies the "include Sakoe-Chiba band" request).
 import sys
 sys.path.insert(0, "/home/claude/overlay")
 
+import re
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import lasio
@@ -119,13 +122,21 @@ from inpefa_dtw_banded import (
     zscore,
 )
 
-FILES = {
-    "SRN-2": "/home/rian/python_project/myvenv/INPEFA_modified/data/SRN-2_Logs.las",
-    "SRN-9": "/home/rian/python_project/myvenv/INPEFA_modified/data/SRN-9_Logs.las",
-    "SRN-10": "/home/rian/python_project/myvenv/INPEFA_modified/data/SRN-10_Logs.las",
-}
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+CSV_DIR = Path(__file__).resolve().parent.parent / "csv_out"
+IMAGE_DIR = Path(__file__).resolve().parent.parent / "image_output"
 SMOOTH_WIN = 201
 DEPTH_REF_FT = 100.0
+
+# The gamma-ray log is not always called GR -- some of these LAS files write
+# it as GAMMA. Matched case-insensitively, first alias present wins, and the
+# column is renamed to GR so the rest of the script has one name to work with.
+GR_ALIASES = ("GR", "GAMMA")
+
+# Colors are handed out per well in discovery order, so any number of wells
+# gets a stable, distinct color across every plot in this script.
+WELL_PALETTE = ["firebrick", "steelblue", "darkgreen", "darkorange", "purple",
+                "teal", "saddlebrown", "magenta", "olive", "navy"]
 
 # --- Emery & Myers / Pertamina slide thresholds ---
 BELL_FUNNEL_LOWER_DEG = 32.0   # |angle| below this -> CYLINDRICAL
@@ -140,13 +151,69 @@ BELL_FUNNEL_UPPER_DEG = 72.0   # kept for reference/plotting; angles beyond
 SHAPE_COLORS = {"BELL": "#2ca02c", "FUNNEL": "#1f77b4", "CYLINDRICAL": "#7f7f7f"}
 
 
+def _natural_key(name):
+    """Sort WELL-2 before WELL-10 (plain string sort would not)."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
+
+
+def discover_wells(data_dir=None):
+    """
+    Every .las in the data folder is a well. The well name is the file stem
+    with a trailing "_Logs"/"_logs" dropped, so ABC-1_Logs.las -> "ABC-1".
+    Returns {well: path}, naturally sorted.
+
+    data_dir defaults to DATA_DIR, but is read at CALL time (not bound as a
+    default argument), so overriding DATA_DIR or passing a folder in works.
+    """
+    data_dir = Path(data_dir if data_dir is not None else DATA_DIR)
+    paths = [p for p in data_dir.iterdir()
+             if p.is_file() and p.suffix.lower() == ".las"]
+    if not paths:
+        raise FileNotFoundError(f"No .las files found in {data_dir}")
+
+    wells = {}
+    for path in sorted(paths, key=lambda p: _natural_key(p.stem)):
+        well = re.sub(r"_logs$", "", path.stem, flags=re.IGNORECASE)
+        if well in wells:
+            raise ValueError(f"Two LAS files map to the same well name {well!r}: "
+                             f"{wells[well].name} and {path.name}")
+        wells[well] = path
+    return wells
+
+
+def well_colors(wells):
+    """One color per well, cycling the palette if there are more wells than colors."""
+    return {w: WELL_PALETTE[i % len(WELL_PALETTE)] for i, w in enumerate(wells)}
+
+
+def resolve_gr_column(df, source=""):
+    """
+    Find the gamma-ray curve whatever this particular LAS calls it: GR,
+    GAMMA, any capitalization. Returns the actual column name.
+    """
+    lookup = {str(c).upper(): c for c in df.columns}
+    for alias in GR_ALIASES:
+        if alias in lookup:
+            return lookup[alias]
+    raise KeyError(f"No gamma-ray curve in {source or 'LAS file'}: looked for "
+                   f"{'/'.join(GR_ALIASES)} (case-insensitive), "
+                   f"found {list(df.columns)}")
+
+
 def load_well(path):
     """
-    THE LAS loading sequence for this project: drop nulls on GR, keep GR in
-    its valid range, sort by depth, reset the index.
+    THE LAS loading sequence for this project: find the gamma-ray curve under
+    whichever mnemonic this file uses and normalize it to GR, drop nulls, keep
+    it in its valid range, sort by depth, reset the index.
     """
     las = lasio.read(path)
     df = las.df().reset_index()
+
+    gr_col = resolve_gr_column(df, Path(path).name)
+    if gr_col != "GR":
+        print(f"  gamma-ray curve is {gr_col!r} -- read as GR")
+        df = df.rename(columns={gr_col: "GR"})
+
     df = df.dropna(subset=["GR"])
     df = df[(df["GR"] >= 0) & (df["GR"] <= 300)]
     return df.sort_values("DEPTH").reset_index(drop=True)
@@ -276,12 +343,12 @@ def run_dtw_correlation(well_data):
         for j in range(i + 1, len(wells)):
             w1, w2 = wells[i], wells[j]
             a, b = resampled[w1], resampled[w2]
-            d, path, window, paths = banded_dtw_distance(a, b)
+            d, path, radius, paths = banded_dtw_distance(a, b)
             results.append({"pair": f"{w1} vs {w2}", "dtw_distance": d,
-                             "sakoe_chiba_window": window})
+                             "sakoe_chiba_radius": radius})
             warping_info[(w1, w2)] = {"a": a, "b": b, "paths": paths,
-                                       "path": path, "window": window}
-            print(f"  {w1} vs {w2}: distance={d:.4f} (band={window} samples)")
+                                       "path": path, "radius": radius}
+            print(f"  {w1} vs {w2}: distance={d:.4f} (band radius={radius} samples)")
 
     print("\n  Building random-walk null distribution...")
     null_dists = random_walk_null_distances()
@@ -302,13 +369,14 @@ def plot_dtw_alignment(w1, w2, warping_info, well_data, z_score, out_path):
     that corridor, and the two curves connected by their alignment.
     """
     info = warping_info[(w1, w2)]
-    a, b, paths, path, window = info["a"], info["b"], info["paths"], info["path"], info["window"]
+    a, b, paths, path, radius = info["a"], info["b"], info["paths"], info["path"], info["radius"]
     n = len(a)
 
     fig = plt.figure(figsize=(14, 12))
     gs = fig.add_gridspec(3, 2, height_ratios=[1, 2.5, 1], width_ratios=[1, 1])
 
-    color1 = "firebrick" if w1 == "SRN-2" else "steelblue"
+    colors = well_colors(well_data)
+    color1, color2 = colors[w1], colors[w2]
 
     ax_a = fig.add_subplot(gs[0, 0])
     ax_a.plot(np.linspace(0, 1, len(a)), a, color=color1, lw=1.2)
@@ -316,7 +384,7 @@ def plot_dtw_alignment(w1, w2, warping_info, well_data, z_score, out_path):
     ax_a.set_xlabel("Fractional depth"); ax_a.grid(alpha=0.3)
 
     ax_b = fig.add_subplot(gs[0, 1])
-    ax_b.plot(np.linspace(0, 1, len(b)), b, color="darkgreen", lw=1.2)
+    ax_b.plot(np.linspace(0, 1, len(b)), b, color=color2, lw=1.2)
     ax_b.set_title(f"{w2} -- INPEFA(GR)", fontsize=10)
     ax_b.set_xlabel("Fractional depth"); ax_b.grid(alpha=0.3)
 
@@ -324,10 +392,10 @@ def plot_dtw_alignment(w1, w2, warping_info, well_data, z_score, out_path):
     cost = np.array(paths)[1:, 1:]
     cost_display = np.where(np.isinf(cost), np.nan, cost)
     im = ax_mat.imshow(cost_display.T, origin="lower", cmap="viridis", aspect="auto")
-    fig.colorbar(im, ax=ax_mat, label="Cumulative DTW cost")
+    fig.colorbar(im, ax=ax_mat, label="Cumulative DTW cost (root of accumulated squared cost)")
 
-    upper = [min(n - 1, i + window) for i in range(n)]
-    lower = [max(0, i - window) for i in range(n)]
+    upper = [min(n - 1, i + radius) for i in range(n)]
+    lower = [max(0, i - radius) for i in range(n)]
     ax_mat.plot(range(n), upper, color="red", lw=1.2, ls="--", label="Sakoe-Chiba band edge")
     ax_mat.plot(range(n), lower, color="red", lw=1.2, ls="--")
 
@@ -337,8 +405,8 @@ def plot_dtw_alignment(w1, w2, warping_info, well_data, z_score, out_path):
 
     ax_mat.set_xlabel(f"{w1} sample index (fractional depth)")
     ax_mat.set_ylabel(f"{w2} sample index (fractional depth)")
-    ax_mat.set_title(f"DTW cost matrix -- band={window} samples "
-                      f"({SAKOE_CHIBA_FRACTION:.0%}), path constrained inside the red corridor",
+    ax_mat.set_title(f"DTW cost matrix -- Sakoe-Chiba radius={radius} samples "
+                      f"({SAKOE_CHIBA_FRACTION:.0%}), |i-j| <= {radius} inside the red corridor",
                       fontsize=11)
     ax_mat.legend(loc="upper left", fontsize=9)
 
@@ -348,7 +416,7 @@ def plot_dtw_alignment(w1, w2, warping_info, well_data, z_score, out_path):
         ax_align.plot([i/n, j/len(b)], [a[i], b[j] + offset],
                       color="gray", lw=0.3, alpha=0.5)
     ax_align.plot(np.linspace(0, 1, len(a)), a, color=color1, lw=1.4, label=w1)
-    ax_align.plot(np.linspace(0, 1, len(b)), b + offset, color="darkgreen", lw=1.4, label=w2)
+    ax_align.plot(np.linspace(0, 1, len(b)), b + offset, color=color2, lw=1.4, label=w2)
     ax_align.set_title(f"Alignment: {w1} vs {w2} (z-score vs random-walk null = {z_score:+.2f})",
                         fontsize=11)
     ax_align.set_xlabel("Fractional depth")
@@ -362,17 +430,44 @@ def plot_dtw_alignment(w1, w2, warping_info, well_data, z_score, out_path):
     print(f"  Saved -> {out_path}")
 
 
-def main():
+def out_path_for(name):
+    """
+    Route an output file to csv_out/ or image_output/ by extension,
+    creating the folder the first time something is written to it.
+    """
+    directory = CSV_DIR if str(name).lower().endswith(".csv") else IMAGE_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / name
+
+
+def write_inpefa_curve(well, df, curve):
+    """
+    One CSV per well holding just the depth and the oriented long-term INPEFA
+    curve -- the same curve the segmentation and the DTW correlation run on --
+    so a single well can be picked up in another tool without re-running this.
+    """
+    out = out_path_for(f"inpefa_curve_{well}.csv")
+    pd.DataFrame({"DEPTH": df["DEPTH"].to_numpy(),
+                  "INPEFA": np.asarray(curve, dtype=float)}).to_csv(out, index=False)
+    print(f"  Saved -> {out}")
+
+
+def main(data_dir=None):
     all_segments = []
     well_data = {}
 
-    for well, path in FILES.items():
+    data_dir = Path(data_dir if data_dir is not None else DATA_DIR)
+    files = discover_wells(data_dir)
+    print(f"Found {len(files)} well(s) in {data_dir}: {', '.join(files)}")
+
+    for well, path in files.items():
         print(f"\n=== {well} (GR, full INPEFA) ===")
         df = load_well(path)
         gr = df["GR"].to_numpy()
 
         ipfy = inpefa_core(gr)
         curve = orient_to_base_level(ipfy[INPEFA_ORDER], curve="GR")
+        write_inpefa_curve(well, df, curve)
 
         ext_idx = find_extrema(curve)
         print(f"  {len(ext_idx)} extrema detected (smooth_win={SMOOTH_WIN})")
@@ -395,30 +490,130 @@ def main():
         print(seg_df.groupby("shape")["thickness_ft"].agg(["mean", "median", "count"]).round(0))
 
     all_df = pd.concat(all_segments, ignore_index=True)
-    all_df.to_csv("angle_shape_EmeryMyers_segments.csv", index=False)
-    print("\nSaved -> angle_shape_EmeryMyers_segments.csv")
+    segments_csv = out_path_for("angle_shape_EmeryMyers_segments.csv")
+    all_df.to_csv(segments_csv, index=False)
+    print(f"\nSaved -> {segments_csv}")
 
-    dtw_results, warping_info, resampled = run_dtw_correlation(well_data)
-    dtw_results.to_csv("angle_shape_EmeryMyers_dtw.csv", index=False)
-    print("\nSaved -> angle_shape_EmeryMyers_dtw.csv")
+    if len(well_data) < 2:
+        print("\nOnly one well -- skipping well-to-well DTW correlation.")
+    else:
+        dtw_results, warping_info, resampled = run_dtw_correlation(well_data)
+        dtw_csv = out_path_for("angle_shape_EmeryMyers_dtw.csv")
+        dtw_results.to_csv(dtw_csv, index=False)
+        print(f"\nSaved -> {dtw_csv}")
 
-    print("\nGenerating complete DTW alignment plots...")
-    for _, row in dtw_results.iterrows():
-        w1, w2 = row["pair"].split(" vs ")
-        out_path = f"dtw_alignment_EmeryMyers_{w1}_vs_{w2}.png"
-        plot_dtw_alignment(w1, w2, warping_info, well_data, row["z_vs_null"], out_path)
+        print("\nGenerating complete DTW alignment plots...")
+        for _, row in dtw_results.iterrows():
+            w1, w2 = row["pair"].split(" vs ")
+            out_path = out_path_for(f"dtw_alignment_EmeryMyers_{w1}_vs_{w2}.png")
+            plot_dtw_alignment(w1, w2, warping_info, well_data, row["z_vs_null"], out_path)
+
+        plot_dtw_matrix(dtw_results, well_data)
 
     plot_wells(well_data)
     plot_angle_distribution(all_df)
 
 
-def plot_wells(well_data, out_path="angle_shape_EmeryMyers_facies.png"):
-    wells = list(FILES.keys())
+def dtw_matrices(dtw_results, wells):
+    """
+    Fold the pairwise DTW results into two square well-by-well matrices,
+    laid out like a confusion matrix: distance (lower = more alike) and
+    z-score against the random-walk null (more negative = more alike than
+    two unrelated integrated curves would be).
+
+    Both are symmetric -- DTW with a symmetric band and a symmetric step
+    pattern gives d(a, b) = d(b, a). The distance diagonal is 0 by
+    definition (a curve against itself); the z diagonal is left as NaN,
+    since "how surprising is a well matching itself" is not a question the
+    null can answer.
+    """
+    idx = {w: i for i, w in enumerate(wells)}
+    n = len(wells)
+    dist = np.full((n, n), np.nan)
+    zmat = np.full((n, n), np.nan)
+    np.fill_diagonal(dist, 0.0)
+    for _, r in dtw_results.iterrows():
+        w1, w2 = r["pair"].split(" vs ")
+        i, j = idx[w1], idx[w2]
+        dist[i, j] = dist[j, i] = r["dtw_distance"]
+        zmat[i, j] = zmat[j, i] = r["z_vs_null"]
+    return dist, zmat
+
+
+def _annotate_matrix(ax, mat, wells, fmt, na_text):
+    """Write each cell's value on top of the heatmap, like a confusion matrix."""
+    finite = mat[np.isfinite(mat)]
+    mid = (finite.min() + finite.max()) / 2 if finite.size else 0.0
+    # shrink the text as the grid grows so cells never collide
+    fs = 10 if len(wells) <= 4 else (8 if len(wells) <= 7 else 6.5)
+    for i in range(len(wells)):
+        for j in range(len(wells)):
+            v = mat[i, j]
+            if not np.isfinite(v):
+                ax.text(j, i, na_text, ha="center", va="center",
+                        color="0.45", fontsize=fs)
+            else:
+                ax.text(j, i, format(v, fmt), ha="center", va="center",
+                        color="white" if v < mid else "black", fontsize=fs)
+    ax.set_xticks(range(len(wells))); ax.set_xticklabels(wells, rotation=45, ha="right")
+    ax.set_yticks(range(len(wells))); ax.set_yticklabels(wells)
+    ax.set_xticks(np.arange(len(wells) + 1) - 0.5, minor=True)
+    ax.set_yticks(np.arange(len(wells) + 1) - 0.5, minor=True)
+    ax.grid(which="minor", color="white", lw=1.5)
+    ax.tick_params(which="minor", length=0)
+
+
+def plot_dtw_matrix(dtw_results, well_data,
+                    out_path=None):
+    """
+    Well-by-well correlation-strength matrix: the pairwise DTW results
+    arranged as a square grid so every well can be read against every other
+    at a glance, the way a confusion matrix is read.
+    """
+    out_path = out_path or out_path_for("dtw_correlation_matrix_EmeryMyers.png")
+    wells = list(well_data.keys())
+    dist, zmat = dtw_matrices(dtw_results, wells)
+
+    # both dimensions grow with the well count so the cells stay readable
+    n = len(wells)
+    fig, axes = plt.subplots(1, 2, figsize=(6.0 + 1.15 * n, 3.2 + 0.55 * n))
+
+    # The diagonal is 0 by construction and carries no information; leaving it
+    # in the color scale would squash the range that actually matters, so the
+    # colors span the off-diagonal (well-to-well) distances only.
+    off_diag = dist.copy()
+    np.fill_diagonal(off_diag, np.nan)
+    im0 = axes[0].imshow(np.ma.masked_invalid(off_diag), cmap="viridis_r")
+    fig.colorbar(im0, ax=axes[0], fraction=0.046, label="Banded DTW distance (RMS per aligned pair)")
+    axes[0].set_title("DTW distance\n(lower = more similar)", fontsize=11)
+    _annotate_matrix(axes[0], off_diag, wells, ".4f", "0")
+
+    zlim = np.nanmax(np.abs(zmat)) if np.isfinite(zmat).any() else 1.0
+    im1 = axes[1].imshow(np.ma.masked_invalid(zmat), cmap="RdYlGn_r",
+                         vmin=-zlim, vmax=zlim)
+    fig.colorbar(im1, ax=axes[1], fraction=0.046, label="z-score vs random-walk null")
+    axes[1].set_title("Correlation strength vs null\n(more negative = stronger)", fontsize=11)
+    _annotate_matrix(axes[1], zmat, wells, "+.2f", "n/a")
+
+    fig.suptitle(f"Well-to-well INPEFA(GR) DTW correlation matrix -- "
+                 f"Sakoe-Chiba band {SAKOE_CHIBA_FRACTION:.0%}", fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(out_path, dpi=140)
+    print(f"Saved -> {out_path}")
+
+
+def plot_wells(well_data, out_path=None):
+    out_path = out_path or out_path_for("angle_shape_EmeryMyers_facies.png")
+    wells = list(well_data.keys())
     shape_cmap = ListedColormap([SHAPE_COLORS["BELL"], SHAPE_COLORS["FUNNEL"],
                                   SHAPE_COLORS["CYLINDRICAL"]])
     shape_to_int = {"BELL": 0, "FUNNEL": 1, "CYLINDRICAL": 2}
 
-    fig, axes = plt.subplots(1, len(wells) * 3, figsize=(16, 13))
+    # width scales with the well count (5.4 in per well keeps the 3-well
+    # figure the size it has always been); the floor keeps the suptitle from
+    # being clipped when only one or two wells are in the folder
+    fig_width = max(11.0, 5.4 * len(wells))
+    fig, axes = plt.subplots(1, len(wells) * 3, figsize=(fig_width, 13))
     for i, well in enumerate(wells):
         data = well_data[well]
         df = data["df"]
@@ -461,7 +656,8 @@ def plot_wells(well_data, out_path="angle_shape_EmeryMyers_facies.png"):
     print(f"\nSaved -> {out_path}")
 
 
-def plot_angle_distribution(all_df, out_path="angle_distribution_EmeryMyers.png"):
+def plot_angle_distribution(all_df, out_path=None):
+    out_path = out_path or out_path_for("angle_distribution_EmeryMyers.png")
     fig, ax = plt.subplots(figsize=(8, 5))
     for shape, color in SHAPE_COLORS.items():
         vals = all_df.loc[all_df["shape"] == shape, "angle_deg"]
@@ -470,7 +666,8 @@ def plot_angle_distribution(all_df, out_path="angle_distribution_EmeryMyers.png"
     ax.axvline(BELL_FUNNEL_LOWER_DEG, color="black", lw=0.8, ls="--")
     ax.set_xlabel("Segment angle (degrees, normalized 100ft vs z-scored full INPEFA)")
     ax.set_ylabel("Count")
-    ax.set_title("Distribution of extrema-segment angles (GR, full INPEFA), SRN-9 + SRN-10")
+    ax.set_title("Distribution of extrema-segment angles (GR, full INPEFA), "
+                 + " + ".join(all_df["WELL"].unique()))
     ax.legend()
     ax.grid(alpha=0.3)
     fig.tight_layout()
@@ -479,4 +676,5 @@ def plot_angle_distribution(all_df, out_path="angle_distribution_EmeryMyers.png"
 
 
 if __name__ == "__main__":
-    main()
+    # optional: python mainpefa.py /path/to/other/las/folder
+    main(sys.argv[1] if len(sys.argv) > 1 else None)

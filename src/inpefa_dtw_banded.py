@@ -85,10 +85,38 @@ def zscore(x):
 
 
 def banded_dtw_distance(a, b, window_fraction=SAKOE_CHIBA_FRACTION):
-    window = max(1, int(round(window_fraction * max(len(a), len(b)))))
-    d, paths = dtw.warping_paths(a, b, window=window)
+    """
+    Sakoe-Chiba banded DTW, returning (distance, path, radius, cost_matrix).
+
+    Two details that have to be right for this to be DTW in the textbook
+    sense rather than just a number that behaves a bit like one:
+
+    1. BAND RADIUS. The Sakoe-Chiba band of radius r is the constraint
+       |i - j| <= r. dtaidistance's `window=w` argument actually admits
+       |i - j| <= w - 1 (verified empirically against its cost matrix), so
+       passing the radius straight through gives a band one cell narrower
+       than advertised. We pass radius + 1 and report the true radius, so
+       the band really is SAKOE_CHIBA_FRACTION of the sequence length.
+
+    2. NORMALIZATION. dtaidistance returns d = sqrt(sum of SQUARED local
+       costs along the optimal path). Dividing that by the path length K
+       mixes units: sqrt(S)/K shrinks like 1/K, so pairs whose optimal path
+       wanders (larger K) get an unearned advantage. The per-step quantity
+       is the root-mean-square cost, sqrt(S/K) = d / sqrt(K), which is what
+       we return -- a distance in the same units as the z-scored curves.
+
+    Caveat worth stating: dtaidistance uses the symmetric1 step pattern
+    (each of the three predecessors charged one local cost), for which no
+    path normalization is exactly length-invariant -- only Sakoe & Chiba's
+    symmetric2 pattern admits exact (N + M) normalization. Dividing by
+    sqrt(K) is the standard practical choice; here every sequence is
+    resampled to the same N_RESAMPLE anyway, so K varies only with how much
+    the path warps, and distances stay comparable across pairs.
+    """
+    radius = max(1, int(round(window_fraction * max(len(a), len(b)))))
+    d, paths = dtw.warping_paths(a, b, window=radius + 1)
     path = dtw.best_path(paths)
-    return d / len(path), path, window, paths
+    return d / np.sqrt(len(path)), path, radius, paths
 
 
 def random_walk_null_distances(n_shuffles=40, n_points=5000,
